@@ -1,0 +1,257 @@
+#!/usr/local/bin/perl
+
+use strict;
+use warnings;
+use Data::Dumper qw(Dumper);
+use Getopt::Std qw(getopts);
+use JSON::RPC::Legacy::Client qw();
+use JSON;
+
+## Rebalance values
+my $autostart      = 5;
+my $rebalance      = 10;
+my $seedleechlow   = 5;
+my $seedleechhigh  = 6;
+
+#my @status = ('Stopped', 'Check Wait', 'Check', 'Download Wait', 'Download', 'Seed Wait', 'Seed');
+my @status = ('Stop', 'CWait', 'Check', 'DWait', 'Downl', 'SWait', 'Seed');
+
+my $usage = <<EOF;
+
+Usage: trcli [-U URI] action [action opts]
+
+Generic options
+    -U URI                  URI to connect to
+    -t torrent[,torrent]    Torrent selector
+    -v                      verbose
+
+Actions
+    -l              List
+    -r newname      Rename
+    -m newpath      Move
+    -R              Rebalance
+
+List options
+    -D              Only show torrents with default path
+    -d path         Only show torrents starting with path
+    -p              Include path before torrent name
+    -n user:pass    authentication user & password
+
+EOF
+
+my %opt = ();
+getopts("U:Dd:Rvlpt:m:r:n:", \%opt) or die $usage;
+
+my $location = $opt{m} or undef;
+my @torrents = ();
+foreach my $arg (split(/,/, $opt{t} || "")) {
+    if ($arg =~ /^\d+$/) {
+        push @torrents, $arg + 0; ## Ensure treated as number by JSON encoder
+    }
+}
+
+my $uri     = $opt{U} || 'http://localhost:9091/transmission/rpc/';
+my $client  = new JSON::RPC::Legacy::Client;
+$client->ua->timeout(600);
+if ($opt{n}) {
+    my ($user, $pass) = split(/:/, $opt{n}, 2);
+    $client->ua->credentials("localhost:9091", "Transmission", $user, $pass);
+}
+my $res;
+
+##
+## get the X-Transmission-Session-Id header
+##
+my $sessionid = $client->ua->get($uri)->header('X-Transmission-Session-Id');
+$client->ua->default_header('X-Transmission-Session-Id' => $sessionid);
+
+##### Get session #####
+
+my $session;
+$res = $client->call($uri, {method=>'session-get'});
+
+if ($res->is_success) {
+    $session = $res->content->{arguments};
+}
+
+#print $session->{"download-dir"}, "\n";
+
+##
+## Choose what method to run
+##
+
+if ($opt{l}) {
+    my $res = torrent_get(\@torrents);
+
+    my $data = $res->content;
+    foreach my $t (@{$data->{arguments}{torrents}}) {
+        next if ($opt{D} && $t->{downloadDir} ne $session->{"download-dir"});
+        next if ($opt{d} && $t->{downloadDir} !~ /^$opt{d}/);
+
+        torrent_print($t);
+    }
+}
+elsif ($opt{m}) {
+    my $res = torrent_set_location();
+    print "Moved - ", Dumper($res->content), "\n";
+}
+elsif ($opt{r}) {
+    my $res = torrent_rename(\@torrents, $opt{r});
+}
+elsif ($opt{R}) {
+    my $res = torrent_get(\@torrents);
+
+    my $data = $res->content;
+    foreach my $t (@{$data->{arguments}{torrents}}) {
+        if ($t->{status} != 0 and $t->{status} != 6) {
+            print "skipping: ";
+            torrent_print($t);
+            next;
+        }
+
+        my $seeders = my $leechers = 0;
+        foreach my $tracker (@{$t->{trackerStats}}) {
+            $seeders  += $tracker->{seederCount};
+            $leechers += $tracker->{leecherCount};
+        }
+
+        ## $autostart <= $seeders <= $rebalance -- keep at current state
+        ## $seedleechlow <= $seeders/$leechers <= $seedleechhigh -- keep at current state
+        ##  prevents pingpong of start/stop due to us counting as a seeder
+        if ($seeders < $autostart) {
+            torrent_start($t);
+        }
+        elsif ($seeders > $rebalance) {
+            if ($leechers == 0) {
+                torrent_stop($t);
+            }
+            elsif ($seeders/$leechers < $seedleechlow)  {
+                torrent_start($t);
+            }
+            elsif ($seeders/$leechers > $seedleechhigh) {
+                torrent_stop($t);
+            }
+        }
+    }
+}
+
+##
+## Method call subroutines
+##
+
+sub torrent_get {
+    my $torrentref = shift @_ or undef;
+    my @getfields = qw(id name status uploadRatio downloadDir peersConnected percentDone 
+                     addedDate activityDate error errorString hashString trackerStats);
+    my $method = {
+        method => 'torrent-get',
+        arguments => {
+            fields => \@getfields,
+        },
+    };
+    if (@{$torrentref}) {
+        $method->{arguments}{ids} = $torrentref;
+    }
+    return do_method($method);
+}
+
+sub torrent_print {
+    my $t = shift @_;
+
+    my $seeders = my $leechers = 0;
+    foreach my $tracker (@{$t->{trackerStats}}) {
+        $seeders += $tracker->{seederCount};
+        $leechers += $tracker->{leecherCount};
+    }
+
+    my $namepath = $opt{p} ? $t->{downloadDir}."/".$t->{name} : $t->{name};
+
+    printf("%4i %-5s %6.2f%% %3.2f %3i/%-3i %s\n", 
+        $t->{id}, $status[$t->{status}], $t->{percentDone}*100, $t->{uploadRatio}, $seeders, $leechers, $namepath);
+}
+
+sub torrent_set_location {
+    my $method = {
+        method => 'torrent-set-location',
+        arguments => {
+            ids      => \@torrents,
+            move     => 1,
+            location => $location,
+        },
+    };
+    return do_method($method);
+}
+
+sub torrent_rename {
+    my ($torrentref,$newname) = @_;
+
+    ## pull down all info on torrent
+    my $res = torrent_get($torrentref);
+    my $torrent = $res->content->{arguments}{torrents}[0];
+
+    my $method = {
+        method => 'torrent-rename-path',
+        arguments => {
+            ids  => $torrent->{id},
+            path => $torrent->{name},
+            name => $newname,
+        },
+    };
+    return do_method($method);
+}
+
+sub torrent_start {
+    my $torrentref = shift @_;
+    my $method = {
+        method => 'torrent-start',
+        arguments => {
+            ids => $torrentref->{id},
+        },
+    };
+    if ($torrentref->{status} == 6) {
+        if ($opt{v}) {
+            print "NoChange: ";
+            torrent_print($torrentref);
+        }
+    }
+    else {
+        print "Starting: ";
+        torrent_print($torrentref);
+        return do_method($method);
+    }
+}
+
+sub torrent_stop {
+    my $torrentref = shift @_;
+    my $method = {
+        method => 'torrent-stop',
+        arguments => {
+            ids => $torrentref->{id},
+        },
+    };
+    if ($torrentref->{status} == 0) {
+        if ($opt{v}) {
+            print "NoChange: ";
+            torrent_print($torrentref);
+        }
+    }
+    else {
+        print "Stopping: ";
+        torrent_print($torrentref);
+        return do_method($method);
+    }
+}
+
+sub do_method {
+    my $method = shift @_;
+    print "Posting: ", encode_json($method), "\n" if $opt{v};
+    my $res = $client->call($uri, $method);
+
+    if ($res->is_success) {
+        return $res;
+    }
+    else {
+        print "Error!\n";
+        exit 1;
+    }
+}
